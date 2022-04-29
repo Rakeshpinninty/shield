@@ -1,0 +1,219 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Associate ShieldAdvanced with our various critical AWS systems
+
+# RM - Definitions for input parameters which must be provided into this template.
+# This tries to define exactly what a legal value looks like, so the script can fail BEFORE it talks to AWS with a bad value.
+Parameters:
+  # ----------------------------------------
+  ClusterShortNameParam:
+    Description: The short-name of the cluster
+    Type: String
+    MinLength: '3'
+    MaxLength: '3'
+    AllowedPattern: "^\w+$"
+    ConstraintDescription: must be the short name of the cluster
+  # ----------------------------------------
+  AutomaticResponseStatusParam:
+    Description: Control whether AWS can automatically respond to an attack.
+    Type: String
+    MinLength: '7'
+    MaxLength: '8'
+    AllowedPattern: "^(ENABLED|DISABLED|IGNORED)$"
+    ConstraintDescription: must be either ENABLED, DISABLED, or IGNORED.
+  # ----------------------------------------
+  AutomaticResponseActionParam:
+    Description: Either Block or Count DDoS events
+    Type: String
+    MinLength: '5'
+    MaxLength: '5'
+    AllowedPattern: "^(BLOCK|COUNT)$"
+    ConstraintDescription: must be either BLOCK or COUNT.
+  # ----------------------------------------
+  ManagedByParam:
+    Type: String
+    Description: A message about which script(s) manage these resources
+    MinLength: '1'
+  # ----------------------------------------
+
+# Definitions of the actual AWS things we want to build.
+Resources:
+  # ShieldAdvanced is attached to things through the use of a policy.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-fms-policy.html#cfn-fms-policy-resourcetypelist
+  MyShieldAdvancedCloudFrontPolicy:
+      Type: AWS::FMS::Policy
+      Properties:
+        PolicyName: ${ClusterShortNameParam}-shieldadvanced-cloudfront-policy
+
+        # False -> Only resources with the specified tags, are in scope of the policy.
+        # (works in combination with the next item)
+        ExcludeResourceTags: false
+
+        # A list of tags which MUST be provided by other resources, if they wish to be protected by Shield.
+        # (if this isn't set, then tags aren't used to modify policy scope)
+        # Resources in our architecture that should offer these tags:
+        #   - Route53 for our vhsgame.com       (tags were added manually)
+        #   - ALB for internal.api.vhsgame.com  (tags are added through MagicRouter and Ingress yaml's)
+        #   - CloudFront Distributions          (TODO - tags are added through ConfigureKubernetes.py)
+        #   - EC2 Instances                     (TODO - tags can be added through KOPS Cluster Config, I would expect)
+        #
+        # NOTE - ALL the following tags must be present on a resource, 
+        #        AND the type of resource must be listed in ResourceTypeList (below), 
+        #        or the resource will not be protected by Shield Advanced.
+        ResourceTags:
+          # A resource MUST state that it wants to be protected by ShieldAdvanced.
+          - Key:        USE_SHIELD_ADVANCED
+            Value:      true
+          # A resource MUST state that it belongs to the correct cluster.
+          - Key: 
+              Fn::Sub:  IS_CLUSTER_${ClusterShortNameParam}   # eg. IS_CLUSTER_vhs
+            Value:      true
+
+        # Specifies the AWS account IDs and AWS Organizations organizational units (OUs) to include in the policy. 
+        # Specifying an OU is the equivalent of specifying all accounts in the OU and in any of its child OUs, 
+        # including any child OUs and accounts that are added at a later time.
+        # You can specify inclusions or exclusions, but not both. If you specify an IncludeMap, AWS Firewall Manager 
+        # applies the policy to all accounts specified by the IncludeMap, and does not evaluate any ExcludeMap specifications. 
+        # If you do not specify an IncludeMap, then Firewall Manager applies the policy to all accounts except for those 
+        # specified by the ExcludeMap.
+        IncludeMap:
+          ACCOUNT:
+          - !Ref AWS::AccountId
+
+        # Indicates if the policy should be automatically applied to new resources
+        RemediationEnabled: true
+
+        # We'll be protecting a list of different kinds of resources...
+        ResourceType: ResourceTypeList
+
+        # ...and this is the list...
+        ResourceTypeList:
+          # RM - NOTE - Regarding costs:  You will be charged the base ShieldAdvanced monthly fee, plus a bit of additional money
+          #                               which is calculated from the clean traffic that passes through the various protected resources.
+          #                               So ideally, we only turn it on for specific resources which are actually being attacked.
+          
+          # Available protections, and whether we want them enabled...
+          # https://docs.aws.amazon.com/waf/latest/developerguide/ddos-protections-by-resource-type.html
+          # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-template-resource-type-ref.html
+#         - AWS::Route53::HostedZone                    # Amazon Route 53 hosted zones.
+#         - AWS::ElasticLoadBalancingV2::LoadBalancer   # Application Load Balancers, Network Load Balancers, Gateway Load Balancers
+          - AWS::CloudFront::Distribution               # Amazon CloudFront distributions.
+#         - AWS::EC2::EIP                               # Amazon EC2 Elastic IP addresses. (Note that AWS ShieldAdvanced is only capable of protecting an EC2 instance if it's using an ElasticIP)
+#         - AWS::GlobalAccelerator::Accelerator         # AWS Global Accelerator standard accelerators.
+#         - AWS::WAFv2::WebACL                          # RM - apparently not a thing.  You cannot protect a WebACL.
+
+        # Details about the security service that is being used to protect the resources.
+        SecurityServicePolicyData:
+          Type:     SHIELD_ADVANCED
+          ManagedServiceData: 
+            type:   SHIELD_ADVANCED
+            automaticResponseConfiguration: 
+              automaticResponseStatus:        
+                Fn::Sub:  ${AutomaticResponseStatusParam} # ENABLED|IGNORED|DISABLED    default is IGNORED.  We cannot enable this until we have functioning health-checks everywhere.
+
+              # For detection and automatic mitigation of application layer attacks, Shield Advanced leverages the historical traffic 
+              # to your protected resource. Awareness of the normal traffic patterns to your application is what enables 
+              # Shield Advanced to isolate attack traffic from the normal traffic to your application. If your protected resource 
+              # doesn’t yet have a history of normal application traffic (e.g. before an application is launched) 
+              # or lacks production traffic for extended periods of time, we recommend enabling the automatic mitigation 
+              # in COUNT mode until a history of normal application traffic has been established for the resource.
+              #
+              # Automatic application layer DDoS mitigation only places rules to mitigate a DDoS attack after testing them 
+              # against historical traffic to verify that they mitigate the attack traffic and don't impact the normal traffic 
+              # to your application.
+              # https://docs.aws.amazon.com/waf/latest/developerguide/ddos-automatic-app-layer-response.html
+              automaticResponseAction:
+                Fn::Sub:  ${AutomaticResponseActionParam} # BLOCK|COUNT                 (required only if automaticResponseStatus == ENABLED)
+
+              overrideCustomerWebaclClassic:  false       # true|false                  default is FALSE
+
+        # Used when deleting a policy. If true, Firewall Manager performs cleanup according to the policy type.
+        # For AWS WAF and Shield Advanced policies, Firewall Manager does the following:
+        # * Deletes rule groups created by Firewall Manager
+        # * Removes web ACLs from in-scope resources
+        # * Deletes web ACLs that contain no rules or rule groups
+        DeleteAllPolicyResources: true
+
+        Tags:
+          - Key: ManagedBy
+            Value: ${ManagedByParam}
+
+  # ShieldAdvanced is attached to things through the use of a policy.
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-fms-policy.html#cfn-fms-policy-resourcetypelist
+  MyShieldAdvancedNonCloudFrontPolicy:
+      Type: AWS::FMS::Policy
+      Properties:
+        PolicyName: ${ClusterShortNameParam}-shieldadvanced-noncloudfront-policy
+
+        # False -> Only resources with the specified tags, are in scope of the policy.
+        # (works in combination with the next item)
+        ExcludeResourceTags: false
+
+        # A list of tags which MUST be provided by other resources, if they wish to be protected by Shield.
+        # (if this isn't set, then tags aren't used to modify policy scope)
+        # Resources in our architecture that should offer these tags:
+        #   - Route53 for our vhsgame.com       (tags were added manually)
+        #   - ALB for internal.api.vhsgame.com  (tags are added through MagicRouter and Ingress yaml's)
+        #   - CloudFront Distributions          (TODO - tags are added through ConfigureKubernetes.py)
+        #   - EC2 Instances                     (TODO - tags can be added through KOPS Cluster Config, I would expect)
+        #
+        # NOTE - ALL the following tags must be present on a resource, 
+        #        AND the type of resource must be listed in ResourceTypeList (below), 
+        #        or the resource will not be protected by Shield Advanced.
+        ResourceTags:
+          # A resource MUST state that it wants to be protected by ShieldAdvanced.
+          - Key:        USE_SHIELD_ADVANCED
+            Value:      true
+          # A resource MUST state that it belongs to the correct cluster.
+          - Key: 
+              Fn::Sub:  IS_CLUSTER_${ClusterShortNameParam}   # eg. IS_CLUSTER_vhs
+            Value:      true
+
+        # Specifies the AWS account IDs and AWS Organizations organizational units (OUs) to include in the policy. 
+        # Specifying an OU is the equivalent of specifying all accounts in the OU and in any of its child OUs, 
+        # including any child OUs and accounts that are added at a later time.
+        # You can specify inclusions or exclusions, but not both. If you specify an IncludeMap, AWS Firewall Manager 
+        # applies the policy to all accounts specified by the IncludeMap, and does not evaluate any ExcludeMap specifications. 
+        # If you do not specify an IncludeMap, then Firewall Manager applies the policy to all accounts except for those 
+        # specified by the ExcludeMap.
+        IncludeMap:
+          ACCOUNT:
+          - !Ref AWS::AccountId
+
+        # Indicates if the policy should be automatically applied to new resources
+        RemediationEnabled: true
+
+        # We'll be protecting a list of different kinds of resources...
+        ResourceType: ResourceTypeList
+
+        # ...and this is the list...
+        ResourceTypeList:
+          # RM - NOTE - Regarding costs:  You will be charged the base ShieldAdvanced monthly fee, plus a bit of additional money
+          #                               which is calculated from the clean traffic that passes through the various protected resources.
+          #                               So ideally, we only turn it on for specific resources which are actually being attacked.
+          
+          # Available protections, and whether we want them enabled...
+          # https://docs.aws.amazon.com/waf/latest/developerguide/ddos-protections-by-resource-type.html
+          # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-template-resource-type-ref.html
+          - AWS::Route53::HostedZone                    # Amazon Route 53 hosted zones.
+          - AWS::ElasticLoadBalancingV2::LoadBalancer   # Application Load Balancers, Network Load Balancers, Gateway Load Balancers
+#         - AWS::CloudFront::Distribution               # Amazon CloudFront distributions.
+#         - AWS::EC2::EIP                               # Amazon EC2 Elastic IP addresses. (Note that AWS ShieldAdvanced is only capable of protecting an EC2 instance if it's using an ElasticIP)
+#         - AWS::GlobalAccelerator::Accelerator         # AWS Global Accelerator standard accelerators.
+#         - AWS::WAFv2::WebACL                          # RM - apparently not a thing.  You cannot protect a WebACL.
+
+        # Details about the security service that is being used to protect the resources.
+        SecurityServicePolicyData:
+          Type:     SHIELD_ADVANCED
+          ManagedServiceData:  ""     # Non-CloudFront resources must use an empty string here.
+
+        # Used when deleting a policy. If true, Firewall Manager performs cleanup according to the policy type.
+        # For AWS WAF and Shield Advanced policies, Firewall Manager does the following:
+        # * Deletes rule groups created by Firewall Manager
+        # * Removes web ACLs from in-scope resources
+        # * Deletes web ACLs that contain no rules or rule groups
+        DeleteAllPolicyResources: true
+
+        Tags:
+          - Key: ManagedBy
+            Value: ${ManagedByParam}
